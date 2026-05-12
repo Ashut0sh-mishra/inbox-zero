@@ -1482,6 +1482,7 @@ describe("aiProcessAssistantChat", () => {
     expect(result).toEqual({
       personalInstructions: "Keep replies concise.",
       ruleNotificationDestinations: [],
+      rulesStatus: "none",
       rules: [],
     });
   });
@@ -1576,8 +1577,6 @@ describe("aiProcessAssistantChat", () => {
             bcc: true,
             url: true,
             folderName: true,
-            draftId: true,
-            draftStatus: true,
           },
         },
         rule: {
@@ -1591,6 +1590,7 @@ describe("aiProcessAssistantChat", () => {
     expect(result).toEqual({
       messageId: "message-1",
       threadId: "thread-1",
+      recordScope: "historical_message_execution",
       executions: [
         {
           executedRuleId: "executed-rule-1",
@@ -1612,8 +1612,6 @@ describe("aiProcessAssistantChat", () => {
               bcc: null,
               url: null,
               folderName: null,
-              draftId: "draft-1",
-              draftStatus: DraftEmailStatus.REPLIED_WITHOUT_DRAFT,
             },
             {
               type: "LABEL",
@@ -1625,8 +1623,6 @@ describe("aiProcessAssistantChat", () => {
               bcc: null,
               url: null,
               folderName: null,
-              draftId: null,
-              draftStatus: null,
             },
           ],
         },

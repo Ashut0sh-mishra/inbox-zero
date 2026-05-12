@@ -14,6 +14,7 @@ type GetUserRulesAndSettingsOutput =
   | {
       personalInstructions: string;
       ruleNotificationDestinations: Array<{ provider: string }>;
+      rulesStatus: "found" | "none";
       rules:
         | Array<{
             name: string;
@@ -78,10 +79,13 @@ export const getUserRulesAndSettingsTool = ({
         setRuleReadState?.(buildRuleReadState(snapshot));
         onRulesStateExposed?.(snapshot.rulesRevision);
 
+        const rules = getVisibleRulesFromSnapshot(snapshot);
+
         return {
           personalInstructions: snapshot.about,
           ruleNotificationDestinations: snapshot.ruleNotificationDestinations,
-          rules: getVisibleRulesFromSnapshot(snapshot),
+          rulesStatus: rules.length > 0 ? "found" : "none",
+          rules,
         };
       } catch (error) {
         logger.error("Failed to load rules and settings", { error });

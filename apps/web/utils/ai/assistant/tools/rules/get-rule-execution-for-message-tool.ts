@@ -20,6 +20,7 @@ type GetRuleExecutionForMessageOutput =
   | {
       messageId: string;
       threadId: string | null;
+      recordScope: "historical_message_execution";
       executions: Array<{
         executedRuleId: string;
         ruleId: string | null;
@@ -39,8 +40,6 @@ type GetRuleExecutionForMessageOutput =
           bcc: string | null;
           url: string | null;
           folderName: string | null;
-          draftId: string | null;
-          draftStatus: string | null;
         }>;
       }>;
     }
@@ -99,8 +98,6 @@ export const getRuleExecutionForMessageTool = ({
                 bcc: true,
                 url: true,
                 folderName: true,
-                draftId: true,
-                draftStatus: true,
               },
             },
             rule: {
@@ -133,14 +130,13 @@ export const getRuleExecutionForMessageTool = ({
             bcc: action.bcc,
             url: action.url,
             folderName: action.folderName,
-            draftId: action.draftId,
-            draftStatus: action.draftStatus,
           })),
         }));
 
         return {
           messageId,
           threadId: executedRules[0]?.threadId ?? null,
+          recordScope: "historical_message_execution",
           executions,
         };
       } catch (error) {
