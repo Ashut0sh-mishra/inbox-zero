@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { z } from "zod";
+import { z } from "zod";
 import { ActionType } from "@/generated/prisma/enums";
 import {
+  createRuleActionSchema,
   createRuleSchema,
   getAvailableActions,
   getExtraActions,
@@ -390,6 +391,110 @@ describe("getExtraActions", () => {
     expect(getExtraActions([ActionType.CALL_WEBHOOK])).not.toContain(
       ActionType.CALL_WEBHOOK,
     );
+  });
+});
+
+describe("createRuleActionSchema — Anthropic 24-optional-param limit (regression for #2323)", () => {
+  // Anthropic's tool/structured-output API rejects schemas with more than 24
+  // optional parameters per tool. Before #2323 was fixed, the action schema
+  // was a z.union of ~11 per-type variants, each with ~8 nullish field
+  // properties, which serialised to ~87 optionals and broke "Prompt to rules".
+  // These tests guard the new single-object shape.
+
+  const ANTHROPIC_OPTIONAL_PARAM_LIMIT = 24;
+
+  function unwrapInnerSchema(schema: z.ZodTypeAny): z.ZodTypeAny {
+    // superRefine returns a ZodEffects wrapping the base object.
+    let current: z.ZodTypeAny = schema;
+    while (current instanceof z.ZodEffects) {
+      current = current._def.schema;
+    }
+    return current;
+  }
+
+  function countOptionalProps(schema: z.ZodTypeAny): number {
+    const inner = unwrapInnerSchema(schema);
+    if (inner instanceof z.ZodArray) {
+      return countOptionalProps(inner.element as z.ZodTypeAny);
+    }
+    if (!(inner instanceof z.ZodObject)) return 0;
+    let count = 0;
+    for (const value of Object.values(inner.shape) as z.ZodTypeAny[]) {
+      if (value.isOptional() || value.isNullable()) count += 1;
+      const valueInner = unwrapInnerSchema(value);
+      if (
+        valueInner instanceof z.ZodObject ||
+        valueInner instanceof z.ZodArray
+      ) {
+        count += countOptionalProps(valueInner);
+      }
+    }
+    return count;
+  }
+
+  it("is not a z.union (avoids per-variant optional-field multiplication)", () => {
+    const schema = createRuleActionSchema("google");
+    const inner = unwrapInnerSchema(schema);
+    expect(inner).not.toBeInstanceOf(z.ZodUnion);
+    expect(inner).not.toBeInstanceOf(z.ZodDiscriminatedUnion);
+    expect(inner).toBeInstanceOf(z.ZodObject);
+  });
+
+  it("keeps total optional params under Anthropic's 24 limit for google", () => {
+    const count = countOptionalProps(createRuleActionSchema("google"));
+    expect(count).toBeLessThan(ANTHROPIC_OPTIONAL_PARAM_LIMIT);
+  });
+
+  it("keeps total optional params under Anthropic's 24 limit for microsoft", () => {
+    const count = countOptionalProps(createRuleActionSchema("microsoft"));
+    expect(count).toBeLessThan(ANTHROPIC_OPTIONAL_PARAM_LIMIT);
+  });
+
+  it("keeps total optional params under Anthropic's 24 limit when wrapped in createRuleSchema (the shape sent to the LLM)", () => {
+    const schema = z.object({
+      rules: z.array(createRuleSchema("microsoft")),
+    });
+    const count = countOptionalProps(schema);
+    expect(count).toBeLessThan(ANTHROPIC_OPTIONAL_PARAM_LIMIT);
+  });
+
+  it("accepts every available action type with only its required fields", () => {
+    const provider = "google";
+    const allTypes = [
+      ...getAvailableActions(provider),
+      ...getExtraActions(),
+    ];
+    const requiredFieldsByType: Partial<
+      Record<ActionType, Record<string, string>>
+    > = {
+      [ActionType.LABEL]: { label: "Newsletters" },
+      [ActionType.SEND_EMAIL]: { to: "to@example.com" },
+      [ActionType.FORWARD]: { to: "to@example.com" },
+      [ActionType.CALL_WEBHOOK]: {
+        webhookUrl: "https://example.com/hook",
+      },
+    };
+
+    for (const type of new Set(allTypes)) {
+      const fields = requiredFieldsByType[type] ?? {};
+      const result = createRuleSchema(provider).safeParse(
+        buildRule({ type, fields, delayInMinutes: null }),
+      );
+      expect(result.success, `${type} should be accepted`).toBe(true);
+    }
+  });
+
+  it("rejects MOVE_FOLDER on google providers via superRefine, not at schema-construction time", () => {
+    // Construction must not throw for non-Microsoft providers.
+    expect(() => createRuleActionSchema("google")).not.toThrow();
+    const result = createRuleSchema("google").safeParse(
+      buildRule({
+        type: ActionType.MOVE_FOLDER,
+        fields: { folderName: "Finance" },
+        delayInMinutes: null,
+      }),
+    );
+    expect(result.success).toBe(false);
   });
 });
 

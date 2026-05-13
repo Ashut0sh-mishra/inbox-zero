@@ -74,66 +74,106 @@ export type RuleAction = {
   delayInMinutes?: number | null;
 };
 
+// NOTE: This schema is intentionally a single flat object (not a z.union or
+// z.discriminatedUnion of per-type variants). Anthropic's tool/structured-output
+// schemas have a hard limit of 24 optional parameters per schema, and unioning
+// ~11 action variants -- each carrying ~8 nullish field properties -- caused
+// "Prompt to rules" to fail with "Schemas contains too many optional parameters
+// (87), which would make grammar compilation inefficient. ... limit: 24"
+// (issue #2323). Collapsing to a single shape with all fields nullish keeps the
+// optional count well under the limit; per-type required fields are enforced
+// in superRefine() below so runtime semantics are preserved.
 export const createRuleActionSchema = (
   provider: string,
 ): z.ZodType<RuleAction> => {
-  const allowedActionTypes = new Set([
-    ...getAvailableActionsForRuleEditor({ provider }),
-    ...getExtraAvailableActionsForRuleEditor(),
-  ]);
-  const optionalFieldsSchema = createOptionalActionFieldsSchema(provider);
+  const allowedActionTypes = Array.from(
+    new Set([
+      ...getAvailableActionsForRuleEditor({ provider }),
+      ...getExtraAvailableActionsForRuleEditor(),
+    ]),
+  ) as ActionType[];
 
-  const actionSchemas: [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]] = [
-    createActionObjectSchema(ActionType.ARCHIVE, optionalFieldsSchema),
-    createActionObjectSchema(
-      ActionType.LABEL,
-      createRequiredLabelFieldsSchema(provider),
-    ),
-    createActionObjectSchema(ActionType.MARK_READ, optionalFieldsSchema),
-    createActionObjectSchema(ActionType.STAR, optionalFieldsSchema),
-    createActionObjectSchema(ActionType.MARK_SPAM, optionalFieldsSchema),
-    createActionObjectSchema(ActionType.DIGEST, optionalFieldsSchema),
-    ...(allowedActionTypes.has(ActionType.DRAFT_EMAIL)
-      ? [createActionObjectSchema(ActionType.DRAFT_EMAIL, optionalFieldsSchema)]
-      : []),
-    ...(allowedActionTypes.has(ActionType.REPLY)
-      ? [createActionObjectSchema(ActionType.REPLY, optionalFieldsSchema)]
-      : []),
-    ...(allowedActionTypes.has(ActionType.FORWARD)
-      ? [
-          createActionObjectSchema(
-            ActionType.FORWARD,
-            createRequiredRecipientFieldsSchema(provider),
-          ),
-        ]
-      : []),
-    ...(allowedActionTypes.has(ActionType.SEND_EMAIL)
-      ? [
-          createActionObjectSchema(
-            ActionType.SEND_EMAIL,
-            createRequiredRecipientFieldsSchema(provider),
-          ),
-        ]
-      : []),
-    ...(allowedActionTypes.has(ActionType.CALL_WEBHOOK)
-      ? [
-          createActionObjectSchema(
-            ActionType.CALL_WEBHOOK,
-            createRequiredWebhookFieldsSchema(provider),
-          ),
-        ]
-      : []),
-    ...(allowedActionTypes.has(ActionType.MOVE_FOLDER)
-      ? [
-          createActionObjectSchema(
-            ActionType.MOVE_FOLDER,
-            createRequiredFolderFieldsSchema(provider),
-          ),
-        ]
-      : []),
-  ];
+  if (allowedActionTypes.length === 0) {
+    throw new Error("No rule actions are available for this provider.");
+  }
 
-  return z.union(actionSchemas) as z.ZodType<RuleAction>;
+  const typeEnum = z.enum(
+    allowedActionTypes as [ActionType, ...ActionType[]],
+  );
+
+  const fieldsSchema = z
+    .object(createActionFieldShape(provider))
+    .nullish()
+    .transform((value) => value ?? null);
+
+  const actionTypeDescription = `The action to apply to the matching email. Allowed values: ${allowedActionTypes.join(", ")}. ${getCombinedActionTypeDescriptions(allowedActionTypes)}`;
+
+  const baseSchema = z.object({
+    type: typeEnum.describe(actionTypeDescription),
+    fields: fieldsSchema,
+    delayInMinutes: delayInMinutesLlmSchema,
+  });
+
+  const requireField = (
+    action: z.infer<typeof baseSchema>,
+    key: keyof RuleActionFields,
+    message: string,
+    ctx: z.RefinementCtx,
+  ) => {
+    const value = action.fields?.[key];
+    if (typeof value !== "string" || value.trim().length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message,
+        path: ["fields", key],
+      });
+    }
+  };
+
+  return baseSchema.superRefine((action, ctx) => {
+    switch (action.type) {
+      case ActionType.LABEL:
+        requireField(action, "label", "LABEL requires fields.label.", ctx);
+        break;
+      case ActionType.SEND_EMAIL:
+        requireField(
+          action,
+          "to",
+          "SEND_EMAIL requires fields.to.",
+          ctx,
+        );
+        break;
+      case ActionType.FORWARD:
+        requireField(action, "to", "FORWARD requires fields.to.", ctx);
+        break;
+      case ActionType.CALL_WEBHOOK:
+        requireField(
+          action,
+          "webhookUrl",
+          "CALL_WEBHOOK requires fields.webhookUrl.",
+          ctx,
+        );
+        break;
+      case ActionType.MOVE_FOLDER:
+        if (!isMicrosoftProvider(provider)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "MOVE_FOLDER is only supported for Microsoft providers.",
+            path: ["type"],
+          });
+        } else {
+          requireField(
+            action,
+            "folderName",
+            "MOVE_FOLDER requires fields.folderName.",
+            ctx,
+          );
+        }
+        break;
+      default:
+        break;
+    }
+  }) as unknown as z.ZodType<RuleAction>;
 };
 
 export const createRuleSchema = (provider: string) =>
@@ -153,14 +193,6 @@ export type CreateRuleSchema = z.infer<ReturnType<typeof createRuleSchema>>;
 export type CreateOrUpdateRuleSchema = CreateRuleSchema & {
   ruleId?: string;
 };
-
-function createActionObjectSchema(type: ActionType, fields: z.ZodTypeAny) {
-  return z.object({
-    type: z.literal(type).describe(getActionTypeDescription(type)),
-    fields,
-    delayInMinutes: delayInMinutesLlmSchema,
-  });
-}
 
 function getActionTypeDescription(type: ActionType) {
   switch (type) {
@@ -193,69 +225,31 @@ function getActionTypeDescription(type: ActionType) {
   }
 }
 
-function createOptionalActionFieldsSchema(provider: string) {
-  return z.object(createActionFieldShape(provider)).nullish();
-}
-
-function createRequiredLabelFieldsSchema(provider: string) {
-  return z.object({
-    ...createActionFieldShape(provider),
-    label: requiredStringField(
-      "The label to apply to the email",
-      "LABEL requires fields.label.",
-    ),
-  });
-}
-
-function createRequiredRecipientFieldsSchema(provider: string) {
-  return z.object({
-    ...createActionFieldShape(provider),
-    to: requiredStringField(
-      "The recipient email address. Required for SEND_EMAIL and FORWARD. Use REPLY when responding to the triggering inbound email.",
-      "fields.to is required.",
-    ),
-  });
-}
-
-function createRequiredWebhookFieldsSchema(provider: string) {
-  return z.object({
-    ...createActionFieldShape(provider),
-    webhookUrl: requiredStringField(
-      "The webhook URL to call",
-      "CALL_WEBHOOK requires fields.webhookUrl.",
-    ),
-  });
-}
-
-function createRequiredFolderFieldsSchema(provider: string) {
-  const fieldShape = createActionFieldShape(provider);
-
-  if (!("folderName" in fieldShape)) {
-    throw new Error("MOVE_FOLDER is only supported for Microsoft providers.");
-  }
-
-  return z.object({
-    ...fieldShape,
-    folderName: requiredStringField(
-      "The folder to move the email to",
-      "MOVE_FOLDER requires fields.folderName.",
-    ),
-  });
+function getCombinedActionTypeDescriptions(types: ActionType[]): string {
+  return types
+    .map((type) => `${type}: ${getActionTypeDescription(type)}`)
+    .join(" ");
 }
 
 function createActionFieldShape(provider: string) {
   return {
-    label: optionalStringField("The label to apply to the email"),
+    label: optionalStringField(
+      "The label to apply to the email. Required when type=LABEL.",
+    ),
     to: optionalStringField(
-      "The recipient email address. Required for SEND_EMAIL and FORWARD. Use REPLY when responding to the triggering inbound email.",
+      "The recipient email address. Required when type=SEND_EMAIL or type=FORWARD. Use REPLY when responding to the triggering inbound email.",
     ),
     cc: optionalStringField("The cc email address to send the email to"),
     bcc: optionalStringField("The bcc email address to send the email to"),
     subject: optionalStringField("The subject of the email"),
     content: optionalStringField("The content of the email"),
-    webhookUrl: optionalStringField("The webhook URL to call"),
+    webhookUrl: optionalStringField(
+      "The webhook URL to call. Required when type=CALL_WEBHOOK.",
+    ),
     ...(isMicrosoftProvider(provider) && {
-      folderName: optionalStringField("The folder to move the email to"),
+      folderName: optionalStringField(
+        "The folder to move the email to. Required when type=MOVE_FOLDER.",
+      ),
     }),
   };
 }
@@ -265,13 +259,5 @@ function optionalStringField(description: string) {
     .string()
     .nullish()
     .transform((value) => value ?? null)
-    .describe(description);
-}
-
-function requiredStringField(description: string, message: string) {
-  return z
-    .string()
-    .transform((value) => value.trim())
-    .refine(Boolean, message)
     .describe(description);
 }
